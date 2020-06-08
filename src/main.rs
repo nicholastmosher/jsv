@@ -3,9 +3,8 @@ use std::io::{Read, BufReader};
 use std::collections::HashMap;
 
 use clap::{App, Arg, ArgMatches};
-use serde::Deserialize;
 use serde_json::Value;
-use serde::export::Formatter;
+use jsonschema_valid::Config as SchemaConfig;
 
 fn main() {
     let matches = app().get_matches();
@@ -18,6 +17,7 @@ fn main() {
 /// Defines the structure of command-line parsing options
 fn app<'a, 'b>() -> App<'a, 'b> {
     App::new("jsv")
+        .about("JSON-Schema Validator for CSV")
         .arg(Arg::with_name("schema")
             .short("s")
             .long("--schema")
@@ -53,135 +53,146 @@ fn execute(args: &ArgMatches) -> Result<(), String> {
     let json_schema: Value = serde_json::from_reader(schema_file)
         .map_err(|e| format!("failed to parse schema as JSON: {:?}", e))?;
 
-    let schema = CsvSchema::from_json(json_schema)?;
+    // Produce a SchemaConfig from the JSON schema object.
+    let schema_config = SchemaConfig::from_schema(&json_schema, None).unwrap();
 
-    let validator = CsvValidator::new(schema);
+    // Use the SchemaConfig for validating values in CSV.
+    let validator = CsvValidator::new(schema_config);
 
-    validator.validate(BufReader::new(csv_file));
+    let result = validator.validate(BufReader::new(csv_file));
+
+    match result {
+        Ok(num) => println!("Successfully validated {} records", num),
+        Err(num) => println!("Validation failed with {} errors", num),
+    }
 
     Ok(())
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Deserialize)]
-enum CsvColumnType {
-    #[serde(rename = "integer")]
-    Integer,
-    #[serde(rename = "string")]
-    String,
-    #[serde(rename = "date")]
-    Date,
-    #[serde(rename = "object")]
-    Object,
+/// Validates CSV fields using the rules from a JSON-Schema validator.
+///
+/// It is important to note that the given JSON Schema must consist of a single
+/// top-level object definition. The keys of this object must correspond to the
+/// header names of the CSV data given. Data values in the CSV are parsed and
+/// validated as if they were primitive JSON values (i.e. any JSON values
+/// except for objects and arrays).
+///
+/// # Example
+///
+/// ```
+/// use jsonschema_valid::Config as SchemaConfig;
+///
+/// fn main() {
+///     let schema = r#"{
+///         "$id": "http://example.com/example.json",
+///         "type": "object",
+///         "properties": {
+///             "id": {
+///                 "$id": "#/properties/id",
+///                 "type": "integer"
+///             }
+///             "name": {
+///                 "$id": "#/properties/name",
+///                 "type": "string"
+///             }
+///         }
+///     }"#;
+///
+///     let schema_json = serde_json::from_str(schema).unwrap();
+///     let schema_config = SchemaConfig::from_schema(&schema_json, None).unwrap();
+///     let validator = CsvValidator::new(schema_config);
+///
+///     let csv = r#"
+///     id,name
+///     0,Bobby
+///     "#;
+///
+///     validator.validate(Cursor::new(csv));
+/// }
+/// ```
+struct CsvValidator<'a> {
+    schema_config: SchemaConfig<'a>,
 }
 
-impl std::fmt::Display for CsvColumnType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CsvColumnType::Integer => write!(f, "integer"),
-            CsvColumnType::String => write!(f, "string"),
-            CsvColumnType::Object => write!(f, "object"),
-            CsvColumnType::Date => write!(f, "date"),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CsvColumnProperty {
-    #[serde(rename = "$id")]
-    id: String,
-    #[serde(rename = "type")]
-    type_: CsvColumnType,
-    title: String,
-    description: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CsvSchema {
-    title: String,
-    description: String,
-    examples: Vec<Value>,
-    required: Vec<String>,
-    properties: HashMap<String, CsvColumnProperty>,
-}
-
-impl CsvSchema {
-    pub fn from_json(json: Value) -> Result<CsvSchema, String> {
-        // Deserialize CsvSchema from a JSON value
-        let csv_schema: CsvSchema = serde_json::from_value(json)
-            .map_err(|e| format!("failed to parse CsvSchema from JSON: {:?}", e))?;
-
-        let errors: Vec<_> = csv_schema.properties.iter()
-            .filter(|(_, props)| props.type_ == CsvColumnType::Object
-                || props.type_ == CsvColumnType::Date)
-            .collect();
-
-        if !errors.is_empty() {
-            use std::fmt::Write;
-            let mut error = String::new();
-            errors.iter().for_each(|(col, props)| {
-                writeln!(error, "schema error: field definition for '{}' has illegal type {}. Only 'integer' and 'string' are supported.",
-                         col,
-                         props.type_);
-            });
-            return Err(error);
-        }
-
-        Ok(csv_schema)
-    }
-}
-
-struct CsvValidator {
-    schema: CsvSchema,
-}
-
-impl CsvValidator {
-    pub fn new(schema: CsvSchema) -> CsvValidator {
+impl CsvValidator<'_> {
+    pub fn new(schema_config: SchemaConfig) -> CsvValidator {
         CsvValidator {
-            schema
+            schema_config
         }
     }
 
-    pub fn validate<R: Read>(&self, input: R) {
+    pub fn validate<R: Read>(&self, input: R) -> Result<usize, usize> {
         let mut csv_reader = csv::ReaderBuilder::new()
             .from_reader(input);
 
-        let column_types: HashMap<usize, CsvColumnType> = match csv_reader.headers() {
-            Err(e) => {
-                eprintln!("failed to read headers from csv file: {:?}", e);
-                return;
-            },
-            Ok(headers) => {
-                if headers.len() != self.schema.properties.len() {
-                    eprintln!("warning: there are {} columns but {} properties in the schema",
-                              headers.len(),
-                              self.schema.properties.len())
+        let headers = csv_reader.headers().unwrap().clone();
+
+        let mut success_count: usize = 0;
+        let mut error_count: usize = 0;
+        for (record_index, result) in csv_reader.records().enumerate() {
+            let record = match result {
+                Err(e) => {
+                    eprintln!("Record error at index {}: {:?}", record_index, e);
+                    continue;
+                },
+                Ok(record) => record,
+            };
+
+            let schema = self.schema_config.get_schema().as_object().unwrap();
+
+            let mut record_map: HashMap<&str, Value> = HashMap::new();
+            for (field_index, (header, field)) in headers.iter().zip(record.iter()).enumerate() {
+
+                // Manually check whether this field has a "string" type in the schema.
+                // If we don't do this, then even though the schema says to treat it
+                // like a string, the JSON parser would read a field like 1234 as a number.
+                let is_string = schema.get("properties")
+                    .and_then(|val| val.as_object())
+                    .and_then(|obj| obj.get(header))
+                    .and_then(|val| val.as_object())
+                    .and_then(|obj| obj.get("type"))
+                    .and_then(|val| val.as_str())
+                    .map(|typ| typ == "string")
+                    .unwrap_or(false);
+
+                // If the schema marks this field as a string, parse it as a string.
+                let maybe_field_value = if is_string {
+                    serde_json::from_str(&format!("\"{}\"", field))
                 }
+                // Otherwise, parse it like normal JSON
+                else {
+                    serde_json::from_str(field)
+                        .or_else(|_| serde_json::from_str(&format!("\"{}\"", field)))
+                };
 
-                let column_types = headers.into_iter()
-                    .enumerate()
-                    .filter_map(|(i, field)| {
-                        self.schema.properties.get(field)
-                            .map(|typ| (i, typ.type_))
-                    }).collect();
+                let field_value: Value = match maybe_field_value {
+                    Err(e) => {
+                        eprintln!("Field error at ({}:{}) for field ({}): {:?}", record_index, field_index, field, e);
+                        continue;
+                    },
+                    Ok(value) => value,
+                };
 
-                println!("Column types: {:?}", column_types);
-                column_types
+                record_map.insert(header, field_value);
             }
-        };
+            let record_value: Value = serde_json::to_value(record_map).unwrap();
 
-        for result in csv_reader.records() {
+            let result = self.schema_config.validate(&record_value);
             match result {
-                Err(e) => eprintln!("error with record: {:?}", e),
-                Ok(record) => {
-                    record.iter()
-                        .enumerate()
-                        .for_each(|(i, field)| {
-                            let maybe_type = column_types.get(&i);
-                            print!("(field {}: {:?}) ", field, maybe_type);
-                        });
-                    println!("Record: {:?}", record);
+                Ok(_) => {
+                    success_count += 1;
+                },
+                Err(e) => {
+                    error_count += 1;
+                    eprintln!("Validation error on record {}:", record_index + 1);
+                    for error in e {
+                        eprintln!("{}", error);
+                    }
                 }
             }
         }
+
+        if error_count == 0 { Ok(success_count) }
+        else { Err(error_count) }
     }
 }
